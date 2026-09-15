@@ -144,6 +144,13 @@ class TavilySearchProvider(SearchProvider):
         else:
             load_env_file()
             self._api_key = os.environ.get("TAVILY_API_KEY", "").strip()
+            if not self._api_key or self._api_key == "your_api_key_here":
+                try:
+                    import streamlit as st
+                    if hasattr(st, "secrets") and "TAVILY_API_KEY" in st.secrets:
+                        self._api_key = str(st.secrets["TAVILY_API_KEY"]).strip()
+                except Exception:
+                    pass
         self.endpoint = endpoint
         self.timeout = timeout
 
@@ -571,6 +578,13 @@ def is_real_search_configured() -> bool:
     """Checks whether real web search (Tavily API key) is configured."""
     load_env_file()
     key = os.environ.get("TAVILY_API_KEY", "").strip()
+    if not key or key == "your_api_key_here":
+        try:
+            import streamlit as st
+            if hasattr(st, "secrets") and "TAVILY_API_KEY" in st.secrets:
+                key = str(st.secrets["TAVILY_API_KEY"]).strip()
+        except Exception:
+            pass
     return bool(key and key != "your_api_key_here")
 
 
