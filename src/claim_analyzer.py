@@ -107,6 +107,16 @@ class ClaimAnalysisResult:
     relevant_sources_count: int = 0
     filtered_irrelevant_sources_count: int = 0
     relevance_audit_notes: Dict[str, str] = field(default_factory=dict)
+    # Consensus is deliberately recorded separately from source quality.  This makes
+    # it possible to explain *why* a verdict was reached without treating a weak or
+    # duplicate result as a vote against direct reporting.
+    direct_supporting_evidence_count: int = 0
+    direct_contradicting_evidence_count: int = 0
+    partial_supporting_evidence_count: int = 0
+    independent_supporting_streams: int = 0
+    independent_contradicting_streams: int = 0
+    weak_sources_count: int = 0
+    syndicated_duplicate_count: int = 0
 
 
 @dataclass
@@ -139,7 +149,7 @@ DIRECTIONAL_VERB_MAP: Dict[str, Set[str]] = {
     "REJECT": {"reject", "rejected", "rejecting", "deny", "denied", "strike down", "struck down", "ban", "banned", "veto", "vetoed", "dismissed", "blocked", "खारिज", "अस्वीकार", "रद्द", "इनकार", "प्रतिबंध"},
     "LAUNCH": {"launch", "launched", "launching", "start", "started", "initiate", "initiated", "unveil", "unveiled", "introduced", "announced", "kicked", "kicks", "commenced", "commence", "शुरू", "प्रक्षेपण", "लॉन्च", "उद्घाटन"},
     "DELAY": {"delay", "delayed", "delaying", "postpone", "postponed", "cancel", "cancelled", "halt", "halted", "suspended", "called off"},
-    "WIN": {"win", "won", "winning", "triumph", "triumphed", "victorious", "beat", "जीत", "जीता"},
+    "WIN": {"win", "won", "winning", "triumph", "triumphed", "victorious", "beat", "beats", "beating", "defeat", "defeated", "defeating", "जीत", "जीता"},
     "LOSE": {"lose", "lost", "losing", "defeat", "defeated", "concede", "conceded", "fail", "failed", "eliminated", "beaten", "हार", "हारा"},
     "ARREST": {"arrest", "arrested", "arresting", "detain", "detained", "detaining", "nabbed", "apprehended", "jailed", "custody", "गिरफ्तार", "हिरासत", "कैद"},
     "FREE": {"release", "released", "releasing", "free", "freed", "acquitted", "cleared", "discharged", "exonerated", "bailed", "रिहा", "बरी"},
@@ -249,12 +259,14 @@ def parse_number_value(token: str) -> Optional[float]:
 
 
 def extract_numbers_and_percentages(text: str) -> Dict[float, str]:
-    """Extracts numbers and percentages, mapping numeric float value to raw token string."""
+    """Extracts quantities, excluding calendar years handled by temporal logic."""
     matches = re.findall(r"(?:\$|€|£|₹)?\b\d+(?:\.\d+)?%?", text)
     result: Dict[float, str] = {}
     for m in matches:
         val = parse_number_value(m)
-        if val is not None:
+        # A year is a date, not a competing numeric measurement.  Comparing it
+        # with a rank, suite number, or an unrelated year caused false disputes.
+        if val is not None and not (m.isdigit() and len(m) == 4 and 1900 <= val <= 2100):
             result[val] = m
     return result
 
@@ -657,8 +669,13 @@ def synthesize_claim_stance(
     contradict_ids: List[str] = []
     neutral_ids: List[str] = []
 
-    total_support_weight = 0.0
-    total_contradict_weight = 0.0
+    # Scores are only a tie-breaker.  Corroboration is based on independent
+    # reporting streams, not an average of all search results.
+    support_streams: Dict[str, float] = {}
+    contradict_streams: Dict[str, float] = {}
+    support_strengths: List[EvidenceStrength] = []
+    contradict_strengths: List[EvidenceStrength] = []
+    direct_support_count = direct_contradict_count = partial_support_count = 0
 
     has_primary_support = False
     has_primary_contradict = False
@@ -675,15 +692,32 @@ def synthesize_claim_stance(
 
         if analysis.stance == EvidenceStance.SUPPORTS and is_source_relevant:
             support_ids.append(item.evidence.evidence_id)
-            total_support_weight += analysis.weight
+            if item.evaluation.relevance_level == RelevanceLevel.DIRECT:
+                direct_support_count += 1
+            else:
+                partial_support_count += 1
+            # A duplicate wire copy is evidence metadata, not another independent
+            # confirmation.  Same-domain stories share a reporting stream too.
+            stream = item.evidence.domain.lower().strip() or item.evidence.evidence_id
+            if item.evaluation.is_independent:
+                support_streams[stream] = max(support_streams.get(stream, 0.0), analysis.weight)
+            support_strengths.append(analysis.evidence_strength)
             if item.evaluation.is_primary:
                 has_primary_support = True
-        elif analysis.stance == EvidenceStance.CONTRADICTS and is_source_relevant:
+        elif (analysis.stance == EvidenceStance.CONTRADICTS and is_source_relevant
+              and analysis.evidence_strength in (EvidenceStrength.STRONG, EvidenceStrength.MODERATE)):
             contradict_ids.append(item.evidence.evidence_id)
-            total_contradict_weight += analysis.weight
+            if item.evaluation.relevance_level == RelevanceLevel.DIRECT:
+                direct_contradict_count += 1
+            stream = item.evidence.domain.lower().strip() or item.evidence.evidence_id
+            if item.evaluation.is_independent:
+                contradict_streams[stream] = max(contradict_streams.get(stream, 0.0), analysis.weight)
+            contradict_strengths.append(analysis.evidence_strength)
             if item.evaluation.is_primary:
                 has_primary_contradict = True
         else:
+            # A weak result can be useful context, but cannot create a factual
+            # dispute against stronger direct reporting on its own.
             neutral_ids.append(item.evidence.evidence_id)
 
     limitations: List[str] = [
@@ -692,17 +726,36 @@ def synthesize_claim_stance(
 
     disputed_summary: Optional[str] = None
 
-    # Stance synthesis rules
+    support_score = sum(support_streams.values())
+    contradict_score = sum(contradict_streams.values())
+    strong_support_streams = sum(
+        1 for item, analysis in zip(evaluated_items, individual_analyses)
+        if analysis.stance == EvidenceStance.SUPPORTS
+        and item.evaluation.is_independent
+        and analysis.relevance_level == RelevanceLevel.DIRECT
+        and analysis.evidence_strength == EvidenceStrength.STRONG
+    )
+    strong_contradict_streams = sum(
+        1 for item, analysis in zip(evaluated_items, individual_analyses)
+        if analysis.stance == EvidenceStance.CONTRADICTS
+        and item.evaluation.is_independent
+        and analysis.relevance_level == RelevanceLevel.DIRECT
+        and analysis.evidence_strength == EvidenceStrength.STRONG
+    )
+
+    # Stance synthesis rules.  A source that is incomplete or neutral is never
+    # put on the contradicting side.  A genuine dispute needs direct, credible
+    # evidence for incompatible predicates on both sides.
     # Case 1: Conflicting evidence from credible relevant sources (Genuine Conflict)
     if support_ids and contradict_ids:
         # Check if primary source decisively breaks the tie
-        if has_primary_support and not has_primary_contradict and total_support_weight > (total_contradict_weight * 2):
+        if has_primary_support and not has_primary_contradict and support_score > (contradict_score * 1.5):
             final_stance = ClaimStance.SUPPORTED
             explanation = (
                 f"Although conflicting mentions were noted in {', '.join(contradict_ids)}, "
                 f"official primary evidence ({', '.join(support_ids)}) authoritatively supports the claim."
             )
-        elif has_primary_contradict and not has_primary_support and total_contradict_weight > (total_support_weight * 2):
+        elif has_primary_contradict and not has_primary_support and contradict_score > (support_score * 1.5):
             final_stance = ClaimStance.CONTRADICTED
             explanation = (
                 f"Although some reports supported the claim ({', '.join(support_ids)}), "
@@ -719,7 +772,19 @@ def synthesize_claim_stance(
 
     # Case 2: Uncontested support
     elif support_ids and not contradict_ids:
-        if total_support_weight >= 0.5:
+        # One strong direct source can establish a simple proposition; two
+        # independent strong streams are explicit corroboration.  Weak evidence
+        # alone cannot cross this boundary.
+        reliable_direct_support = any(
+            analysis.stance == EvidenceStance.SUPPORTS
+            and item.evaluation.is_independent
+            and analysis.relevance_level == RelevanceLevel.DIRECT
+            and analysis.evidence_strength in (EvidenceStrength.STRONG, EvidenceStrength.MODERATE)
+            and analysis.weight >= 0.50
+            for item, analysis in zip(evaluated_items, individual_analyses)
+        )
+        if (has_primary_support or strong_support_streams >= 1 or reliable_direct_support
+                or len(support_streams) >= 2):
             final_stance = ClaimStance.SUPPORTED
             sources_summary = f"supported by reliable evidence ({', '.join(support_ids)})"
             if has_primary_support:
@@ -735,7 +800,7 @@ def synthesize_claim_stance(
 
     # Case 3: Uncontested contradiction
     elif contradict_ids and not support_ids:
-        if total_contradict_weight >= 0.5:
+        if has_primary_contradict or strong_contradict_streams >= 1 or contradict_score >= 0.70:
             final_stance = ClaimStance.CONTRADICTED
             sources_summary = f"directly refuted by reliable evidence ({', '.join(contradict_ids)})"
             if has_primary_contradict:
@@ -770,7 +835,7 @@ def synthesize_claim_stance(
         if has_primary_support or any(a.evidence_strength == EvidenceStrength.STRONG for a in individual_analyses if a.stance == EvidenceStance.SUPPORTS):
             claim_strength = EvidenceStrength.STRONG
             strength_explanation = "Substantiated by strong independent or primary documentation directly addressing the assertion."
-        elif total_support_weight >= 0.6:
+        elif support_score >= 0.6:
             claim_strength = EvidenceStrength.MODERATE
             strength_explanation = "Substantiated by credible factual reporting with standard evidentiary depth."
         else:
@@ -794,12 +859,14 @@ def synthesize_claim_stance(
             claim_strength = EvidenceStrength.INSUFFICIENT
             strength_explanation = "Zero direct relevant evidence found to confirm or refute the assertion."
 
-    # Domain metrics
+    # Domain metrics and transparent consensus audit
     unique_domains = list({it.evidence.domain for it in evaluated_items if it.evidence.domain})
     primary_count = sum(1 for it in evaluated_items if it.evaluation.is_primary)
     independent_count = sum(1 for it in evaluated_items if it.evaluation.is_independent and not it.evaluation.is_opinion)
     syndicated_count = sum(1 for it in evaluated_items if it.evaluation.is_syndicated_wire)
     opinion_count = sum(1 for it in evaluated_items if it.evaluation.is_opinion)
+    weak_count = sum(1 for it in evaluated_items if it.evaluation.evidence_strength == EvidenceStrength.WEAK)
+    duplicate_count = sum(1 for it in evaluated_items if not it.evaluation.is_independent)
 
     return ClaimAnalysisResult(
         claim_id=claim.claim_id,
@@ -824,6 +891,13 @@ def synthesize_claim_stance(
         relevant_sources_count=len(evaluated_items),
         filtered_irrelevant_sources_count=len(filtered_list),
         relevance_audit_notes=audit_notes,
+        direct_supporting_evidence_count=direct_support_count,
+        direct_contradicting_evidence_count=direct_contradict_count,
+        partial_supporting_evidence_count=partial_support_count,
+        independent_supporting_streams=len(support_streams),
+        independent_contradicting_streams=len(contradict_streams),
+        weak_sources_count=weak_count,
+        syndicated_duplicate_count=duplicate_count,
     )
 
 

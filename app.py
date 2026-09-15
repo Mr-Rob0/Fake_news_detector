@@ -212,6 +212,15 @@ def render_claim_analysis_section(
             c5.metric("Supporting", sup_cnt)
             c6.metric("Contradicting", con_cnt)
 
+            st.caption(
+                "Consensus: "
+                f"{analysis.direct_supporting_evidence_count} direct support / "
+                f"{analysis.direct_contradicting_evidence_count} direct contradiction; "
+                f"{analysis.independent_supporting_streams} independent supporting stream(s), "
+                f"{analysis.independent_contradicting_streams} contradicting stream(s); "
+                f"{analysis.syndicated_duplicate_count} duplicate or same-publisher result(s) discounted."
+            )
+
             if analysis.disputed_summary:
                 st.warning(f"⚖️ **Dispute Notice:** {analysis.disputed_summary}")
 
